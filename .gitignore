@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.dbtool/
+*.egg-info/
+dist/
+.idea/
+.venv/
