@@ -738,6 +738,9 @@ def main():
         box=box.DOUBLE, expand=False,
     ))
 
+    from .config import PROJECT_DIR
+    console.print(f"[dim]config: {PROJECT_DIR}[/]")
+
     cfg = load_config()
 
     if args.command:

@@ -5,7 +5,13 @@ Chunked PostgreSQL dump & restore. Built for moving large tables over dodgy conn
 ## install
 
 ```bash
+# from the project directory
 poetry install
+
+# or install globally so you can run it from anywhere
+pipx install .
+# or
+pip install --user .
 ```
 
 ## usage
@@ -33,7 +39,9 @@ Two dump modes:
 - `copy` — native COPY format, fast as it gets for pg-to-pg
 - `insert` — generates self-contained `.sql` files with BEGIN/COMMIT, schema DDL, index management etc. Slower but portable and you can just `psql -f` them
 
-## settings
+## config
+
+dbtool looks for `.dbtool/` in the current directory (walking up to find a project root), and falls back to `~/.dbtool/` if nothing is found. First run creates a starter `config.toml` with defaults.
 
 Everything lives in `.dbtool/config.toml`. The settings menu lets you toggle stuff like:
 

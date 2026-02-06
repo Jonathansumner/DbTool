@@ -4,10 +4,29 @@ from pathlib import Path
 
 import tomli_w
 
-# everything lives in the project directory
-PROJECT_DIR = Path.cwd() / ".dbtool"
-CONFIG_FILE = PROJECT_DIR / "config.toml"
 DEFAULT_CHUNK_ROWS = 500_000
+
+
+def _resolve_project_dir() -> Path:
+    """check cwd for .dbtool/, walk up parents, fall back to ~/.dbtool/"""
+    # check cwd and parents for an existing .dbtool/
+    cwd = Path.cwd()
+    for p in [cwd, *cwd.parents]:
+        candidate = p / ".dbtool"
+        if candidate.is_dir():
+            return candidate
+        # stop at home dir
+        if p == Path.home():
+            break
+    # check if cwd has a pyproject.toml (project root) — use local .dbtool/
+    if (cwd / "pyproject.toml").exists():
+        return cwd / ".dbtool"
+    # fall back to home
+    return Path.home() / ".dbtool"
+
+
+PROJECT_DIR = _resolve_project_dir()
+CONFIG_FILE = PROJECT_DIR / "config.toml"
 DEFAULT_DUMP_DIR = str(PROJECT_DIR / "dumps")
 
 
@@ -30,7 +49,6 @@ class DBConfig:
 
 @dataclass
 class DumpSettings:
-    """all configurable dump/restore settings, persisted in [settings] section."""
     dump_dir: str = DEFAULT_DUMP_DIR
     chunk_rows: int = DEFAULT_CHUNK_ROWS
     compress: bool = True
@@ -75,7 +93,10 @@ def load_config() -> dict:
     PROJECT_DIR.mkdir(exist_ok=True)
     if CONFIG_FILE.exists():
         return tomllib.loads(CONFIG_FILE.read_text())
-    return {"connections": [], "settings": asdict(DumpSettings())}
+    # first run — write a starter config
+    cfg = {"connections": [], "settings": asdict(DumpSettings())}
+    save_config(cfg)
+    return cfg
 
 
 def save_config(cfg: dict):
