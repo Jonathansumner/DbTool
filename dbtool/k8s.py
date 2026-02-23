@@ -11,9 +11,9 @@ def _run(cmd: list[str], check=True, capture=True) -> subprocess.CompletedProces
     return subprocess.run(cmd, capture_output=capture, text=True, check=check, timeout=30)
 
 
-def _run_long(cmd: list[str]) -> subprocess.CompletedProcess:
+def _run_long(cmd: list[str], timeout: int = 1800) -> subprocess.CompletedProcess:
     """for kubectl cp which can take a while — stream output."""
-    return subprocess.run(cmd, text=True, timeout=600)
+    return subprocess.run(cmd, text=True, check=True, timeout=timeout)
 
 
 # ── tool checks ──────────────────────────────────────────────────────────────
@@ -163,12 +163,72 @@ def list_pods(namespace: str | None = None) -> list[dict]:
 
 # ── kubectl cp ───────────────────────────────────────────────────────────────
 
+def kube_mkdir(
+    pod_name: str,
+    remote_path: str,
+    namespace: str | None = None,
+) -> bool:
+    """create directory on pod via kubectl exec mkdir -p."""
+    cmd = ["kubectl", "exec", pod_name]
+    if namespace:
+        cmd.extend(["-n", namespace])
+    cmd.extend(["--", "mkdir", "-p", remote_path])
+    try:
+        _run(cmd)
+        return True
+    except Exception as e:
+        console.print(f"[error]failed to create remote dir {remote_path}: {e}[/]")
+        return False
+
+
+def kube_exec(
+    pod_name: str,
+    command: list[str],
+    namespace: str | None = None,
+    timeout: int = 1800,
+) -> subprocess.CompletedProcess | None:
+    """run a command on pod. returns CompletedProcess or None on failure."""
+    cmd = ["kubectl", "exec", pod_name]
+    if namespace:
+        cmd.extend(["-n", namespace])
+    cmd.extend(["--"] + command)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout)
+    except Exception as e:
+        console.print(f"[error]kubectl exec failed: {e}[/]")
+        return None
+
+
+def kube_ls_sizes(
+    pod_name: str,
+    remote_path: str,
+    namespace: str | None = None,
+) -> list[tuple[str, int]]:
+    """list files with sizes in a directory on pod. returns [(filename, size_bytes)]."""
+    cmd = ["kubectl", "exec", pod_name]
+    if namespace:
+        cmd.extend(["-n", namespace])
+    cmd.extend(["--", "find", remote_path, "-maxdepth", "1", "-type", "f",
+                 "-printf", r"%f\t%s\n"])
+    try:
+        r = _run(cmd)
+        results = []
+        for line in r.stdout.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) == 2 and parts[1].isdigit():
+                results.append((parts[0], int(parts[1])))
+        return sorted(results, key=lambda x: x[0])
+    except Exception:
+        return []
+
+
 def kube_cp_to_pod(
     local_path: Path,
     pod_name: str,
     remote_path: str,
     namespace: str | None = None,
     container: str | None = None,
+    quiet: bool = False,
 ) -> bool:
     """copy local file/dir to pod. returns True on success."""
     remote = f"{pod_name}:{remote_path}"
@@ -178,15 +238,18 @@ def kube_cp_to_pod(
     if container:
         cmd.extend(["-c", container])
 
-    console.print(f"[dim]$ {' '.join(cmd)}[/]")
+    if not quiet:
+        console.print(f"[dim]$ {' '.join(cmd)}[/]")
     try:
         _run_long(cmd)
         return True
     except subprocess.CalledProcessError as e:
-        console.print(f"[error]kubectl cp failed: {e}[/]")
+        if not quiet:
+            console.print(f"[error]kubectl cp failed: {e}[/]")
         return False
     except subprocess.TimeoutExpired:
-        console.print("[error]kubectl cp timed out[/]")
+        if not quiet:
+            console.print("[error]kubectl cp timed out[/]")
         return False
 
 
@@ -196,6 +259,7 @@ def kube_cp_from_pod(
     local_path: Path,
     namespace: str | None = None,
     container: str | None = None,
+    quiet: bool = False,
 ) -> bool:
     """copy file/dir from pod to local. returns True on success."""
     remote = f"{pod_name}:{remote_path}"
@@ -205,13 +269,105 @@ def kube_cp_from_pod(
     if container:
         cmd.extend(["-c", container])
 
-    console.print(f"[dim]$ {' '.join(cmd)}[/]")
+    if not quiet:
+        console.print(f"[dim]$ {' '.join(cmd)}[/]")
     try:
         _run_long(cmd)
         return True
     except subprocess.CalledProcessError as e:
-        console.print(f"[error]kubectl cp failed: {e}[/]")
+        if not quiet:
+            console.print(f"[error]kubectl cp failed: {e}[/]")
         return False
     except subprocess.TimeoutExpired:
-        console.print("[error]kubectl cp timed out[/]")
+        if not quiet:
+            console.print("[error]kubectl cp timed out[/]")
         return False
+
+
+# ── remote SQL + file helpers ───────────────────────────────────────────────
+
+def kube_psql(
+    pod_name: str,
+    db_url_env: str,
+    sql: str,
+    namespace: str | None = None,
+    flags: str = "-t -A",
+    timeout: int = 3600,
+) -> tuple[bool, str]:
+    """run SQL on pod via psql. returns (success, stdout).
+
+    db_url_env is the env var name (e.g. 'INDEX_DB_URL'), NOT the value.
+    """
+    cmd = ["kubectl", "exec", pod_name]
+    if namespace:
+        cmd.extend(["-n", namespace])
+    cmd.extend(["--", "bash", "-c", f"psql ${db_url_env} {flags} -c {_shell_quote(sql)}"])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, r.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except Exception as e:
+        return False, str(e)
+
+
+def kube_psql_pipe(
+    pod_name: str,
+    db_url_env: str,
+    sql_commands: str,
+    namespace: str | None = None,
+    timeout: int = 3600,
+) -> tuple[bool, str]:
+    """pipe multiple SQL commands into psql on pod. returns (success, stdout)."""
+    cmd = ["kubectl", "exec", pod_name]
+    if namespace:
+        cmd.extend(["-n", namespace])
+    cmd.extend(["--", "bash", "-c", f"psql ${db_url_env} -q"])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, input=sql_commands, timeout=timeout)
+        return r.returncode == 0, r.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except Exception as e:
+        return False, str(e)
+
+
+def kube_write_file(
+    pod_name: str,
+    remote_path: str,
+    content: str,
+    namespace: str | None = None,
+) -> bool:
+    """write a text file on a pod via kubectl exec."""
+    cmd = ["kubectl", "exec", pod_name]
+    if namespace:
+        cmd.extend(["-n", namespace])
+    cmd.extend(["--", "bash", "-c", f"cat > {remote_path}"])
+    try:
+        r = subprocess.run(cmd, input=content, text=True, capture_output=True, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def kube_read_file(
+    pod_name: str,
+    remote_path: str,
+    namespace: str | None = None,
+) -> str | None:
+    """read a file from pod. returns content or None."""
+    cmd = ["kubectl", "exec", pod_name]
+    if namespace:
+        cmd.extend(["-n", namespace])
+    cmd.extend(["--", "cat", remote_path])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _shell_quote(s: str) -> str:
+    """quote a string for shell — wrap in $'...' with escaping."""
+    escaped = s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+    return f"$'{escaped}'"

@@ -31,13 +31,227 @@ class DumpManifest:
     compressed: bool = True
     dump_mode: str = "copy"
     has_schema: bool = False
+    single_file: bool = False
 
     def chunk_filename(self, idx: int) -> str:
+        if self.single_file:
+            if self.dump_mode == "insert":
+                return f"{self.table}{'.sql.gz' if self.compressed else '.sql'}"
+            return f"{self.table}{'.csv.gz' if self.compressed else '.csv'}"
         if self.dump_mode == "insert":
             ext = ".sql.gz" if self.compressed else ".sql"
         else:
             ext = ".csv.gz" if self.compressed else ".csv"
         return f"{self.table}_chunk_{idx:06d}{ext}"
+
+
+class _ChunkSplitter:
+    """file-like object that receives streaming COPY output and splits into chunk files.
+
+    psycopg2's copy_expert streams data into this via write() calls.
+    we count newlines (rows) and flush to a new chunk file every chunk_rows rows.
+    """
+
+    def __init__(
+        self,
+        table_dir: Path,
+        table: TableInfo,
+        manifest: DumpManifest,
+        settings: DumpSettings,
+        schema_ddl: str | None,
+        index_defs: list[tuple[str, str]],
+        chunks_total: int,
+        start_chunk: int,
+        progress: ChunkProgress,
+    ):
+        self.table_dir = table_dir
+        self.table = table
+        self.manifest = manifest
+        self.settings = settings
+        self.schema_ddl = schema_ddl
+        self.index_defs = index_defs
+        self.chunks_total = chunks_total
+        self.start_chunk = start_chunk
+        self.progress = progress
+
+        self.chunk_rows = settings.chunk_rows
+        self.chunk_idx = 0           # current chunk being built
+        self.row_count = 0           # rows in current chunk
+        self.total_rows_seen = 0     # total rows streamed so far
+        self.skip_rows = start_chunk * settings.chunk_rows  # rows to skip on resume
+        self.buf = BytesIO()
+        self.t_start = time.monotonic()
+
+        # track whether we've seen any data at all
+        self._leftover = b""
+
+    def write(self, data: bytes) -> int:
+        """called by copy_expert with chunks of COPY output."""
+        # prepend any leftover from the last call (partial line)
+        data = self._leftover + data
+        self._leftover = b""
+
+        # if data doesn't end with newline, the last piece is a partial row
+        if data and not data.endswith(b"\n"):
+            last_nl = data.rfind(b"\n")
+            if last_nl == -1:
+                # entire chunk is a partial row — buffer it
+                self._leftover = data
+                return len(data)
+            self._leftover = data[last_nl + 1:]
+            data = data[:last_nl + 1]
+
+        # process complete rows
+        pos = 0
+        while pos < len(data):
+            if interrupted:
+                return len(data)
+
+            # how many more rows until this chunk is full?
+            rows_remaining = self.chunk_rows - self.row_count
+            # find that many newlines
+            end = pos
+            found = 0
+            while found < rows_remaining and end < len(data):
+                nl = data.find(b"\n", end)
+                if nl == -1:
+                    break
+                end = nl + 1
+                found += 1
+
+            if found == 0:
+                # no complete rows left
+                break
+
+            # are we still in the skip zone (resume)?
+            if self.total_rows_seen + found <= self.skip_rows:
+                self.total_rows_seen += found
+                self.row_count += found
+                pos = end
+                if self.row_count >= self.chunk_rows:
+                    # skip this chunk entirely
+                    self.chunk_idx += 1
+                    self.row_count = 0
+                    self.buf = BytesIO()
+                continue
+
+            # if we're partially in the skip zone, trim
+            if self.total_rows_seen < self.skip_rows:
+                skip_here = self.skip_rows - self.total_rows_seen
+                # skip skip_here rows from start of this segment
+                skip_end = pos
+                for _ in range(skip_here):
+                    nl = data.find(b"\n", skip_end)
+                    skip_end = nl + 1
+                self.total_rows_seen += skip_here
+                self.row_count += skip_here
+                found -= skip_here
+                pos = skip_end
+
+            # write rows to buffer
+            segment = data[pos:end]
+            self.buf.write(segment)
+            self.row_count += found
+            self.total_rows_seen += found
+            pos = end
+
+            # chunk full?
+            if self.row_count >= self.chunk_rows:
+                self._flush_chunk()
+
+        return len(data) + len(self._leftover)
+
+    def _flush_chunk(self):
+        """write the buffered chunk to disk."""
+        if self.chunk_idx < self.start_chunk:
+            # skip — already on disk from previous run
+            self.chunk_idx += 1
+            self.row_count = 0
+            self.buf = BytesIO()
+            return
+
+        raw = self.buf.getvalue()
+        if not raw:
+            self.chunk_idx += 1
+            self.row_count = 0
+            self.buf = BytesIO()
+            return
+
+        chunk_file = self.table_dir / self.manifest.chunk_filename(self.chunk_idx)
+
+        # insert mode: convert COPY data to SQL
+        if self.settings.dump_mode == "insert":
+            is_first = (self.chunk_idx == 0)
+            is_last = (self.chunk_idx == self.chunks_total - 1)
+            raw = _build_sql_chunk(
+                raw, self.table, self.settings, self.schema_ddl,
+                self.index_defs, is_first=is_first, is_last=is_last,
+            )
+
+        # write to disk
+        if self.settings.compress:
+            with gzip.open(chunk_file, "wb", compresslevel=self.settings.compress_level) as f:
+                f.write(raw)
+        else:
+            with open(chunk_file, "wb") as f:
+                f.write(raw)
+
+        # update manifest + progress
+        self.chunk_idx += 1
+        self.manifest.chunks_completed = self.chunk_idx
+        _write_manifest(self.table_dir / "manifest.json", self.manifest)
+
+        elapsed = time.monotonic() - self.t_start
+        written_rows = self.total_rows_seen - self.skip_rows
+        rps = int(written_rows / elapsed) if elapsed > 0 else 0
+        self.progress.update(self.total_rows_seen, self.chunk_idx, f"{humanize.intcomma(rps)} rows/s")
+
+        # reset for next chunk
+        self.row_count = 0
+        self.buf = BytesIO()
+
+    def flush_remaining(self):
+        """flush any remaining buffered data as the final chunk."""
+        # handle leftover partial line (shouldn't happen with COPY, but be safe)
+        if self._leftover:
+            self.buf.write(self._leftover)
+            self.row_count += 1
+            self.total_rows_seen += 1
+            self._leftover = b""
+
+        if self.row_count > 0:
+            # mark as last chunk for insert mode epilogue
+            self.chunks_total = self.chunk_idx + 1
+            self.manifest.chunks_total = self.chunks_total
+            self._flush_chunk()
+
+
+class _SingleFileWriter:
+    """file-like that receives streaming COPY output and writes to one compressed file."""
+
+    def __init__(self, out_path: Path, compress: bool, compress_level: int,
+                 total_rows_est: int, table_name: str, progress: ChunkProgress):
+        self.total_rows_est = total_rows_est
+        self.table_name = table_name
+        self.progress = progress
+        self.total_rows = 0
+        self.t_start = time.monotonic()
+
+        if compress:
+            self._fh = gzip.open(out_path, "wb", compresslevel=compress_level)
+        else:
+            self._fh = open(out_path, "wb")
+
+    def write(self, data: bytes) -> int:
+        self._fh.write(data)
+        self.total_rows += data.count(b"\n")
+        elapsed = time.monotonic() - self.t_start
+        rps = int(self.total_rows / elapsed) if elapsed > 0 else 0
+        self.progress.update(self.total_rows, 1, f"{humanize.intcomma(rps)} rows/s")
+        return len(data)
+
+    def close(self):
+        self._fh.close()
 
 
 def dump_table(
@@ -48,7 +262,8 @@ def dump_table(
     settings: DumpSettings,
     resume: bool = True,
 ):
-    table_dir = output_dir / dbname / table.name
+    safe_conn_name = db_cfg.name.replace(" ", "_").replace("(", "").replace(")", "")
+    table_dir = output_dir / safe_conn_name / dbname / table.name
     table_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = table_dir / "manifest.json"
 
@@ -80,7 +295,6 @@ def dump_table(
         try:
             from .db import get_index_info
             raw_indexes = get_index_info(db_cfg, dbname, table)
-            # filter out PK indexes
             conn_tmp = connect(db_cfg, dbname)
             try:
                 with conn_tmp.cursor() as cur_tmp:
@@ -99,10 +313,18 @@ def dump_table(
     conn = connect(db_cfg, dbname)
     try:
         with conn.cursor() as cur:
-            console.print(f"  [dim]counting rows in {table.name}…[/]", end="")
-            cur.execute(f'SELECT count(*) FROM "{table.name}"')
-            total_rows = cur.fetchone()[0]
-            console.print(f" [info]{humanize.intcomma(total_rows)}[/]")
+            # use pg_stat estimate — instant, avoids full table scan
+            cur.execute("""
+                SELECT n_live_tup FROM pg_stat_user_tables
+                WHERE schemaname = %s AND relname = %s
+            """, (table.schema, table.name))
+            row = cur.fetchone()
+            total_rows = max(row[0] if row else 0, table.row_estimate)
+            if total_rows == 0:
+                # fallback: maybe stats are stale, try a quick count
+                cur.execute(f'SELECT count(*) FROM "{table.name}"')
+                total_rows = cur.fetchone()[0]
+            console.print(f"  [dim]{table.name}[/] ~{humanize.intcomma(total_rows)} rows (estimate)")
 
             if total_rows == 0:
                 console.print(f"  [dim]empty table, skipping[/]")
@@ -112,70 +334,97 @@ def dump_table(
                 ))
                 return
 
+            # ── single-file mode ──────────────────────────────────────
+            if settings.single_file:
+                ext = ".csv.gz" if settings.compress else ".csv"
+                out_file = table_dir / f"{table.name}{ext}"
+
+                if out_file.exists() and manifest_path.exists():
+                    existing = json.loads(manifest_path.read_text())
+                    if existing.get("finished_at"):
+                        console.print(f"  [dim]skipping {table.name} — already completed[/]")
+                        return
+
+                manifest = _make_manifest(
+                    db_cfg, dbname, table, settings, total_rows,
+                    0, 1, has_schema=has_schema,
+                )
+                _write_manifest(manifest_path, manifest)
+
+                copy_sql = f'COPY "{table.name}" TO STDOUT'
+
+                with ChunkProgress(table.name, "bold blue", total_rows, 0, 1, total_rows) as prog:
+                    writer = _SingleFileWriter(
+                        out_file, settings.compress, settings.compress_level,
+                        total_rows, table.name, prog,
+                    )
+                    try:
+                        cur.copy_expert(copy_sql, writer)
+                    except KeyboardInterrupt:
+                        conn.cancel()
+                        writer.close()
+                        raise
+                    writer.close()
+                    rows_dumped = writer.total_rows
+
+                if not interrupted:
+                    manifest.chunks_completed = 1
+                    manifest.total_rows = rows_dumped
+                    manifest.finished_at = datetime.now().isoformat()
+                    _write_manifest(manifest_path, manifest)
+                    fsize = out_file.stat().st_size
+                    console.print(
+                        f"  [success]✓ {table.name}[/] — "
+                        f"{humanize.intcomma(rows_dumped)} rows, "
+                        f"single file, "
+                        f"{humanize.naturalsize(fsize, binary=True)} on disk"
+                    )
+                else:
+                    console.print(f"  [warning]⏸ {table.name} — interrupted[/]")
+                return
+
+            # ── chunked mode ─────────────────────────────────────────
             chunk_rows = settings.chunk_rows
             chunks_total = (total_rows + chunk_rows - 1) // chunk_rows
             manifest = _make_manifest(
                 db_cfg, dbname, table, settings, total_rows,
                 start_chunk, chunks_total, has_schema=has_schema,
             )
+            _write_manifest(manifest_path, manifest)
 
-            order_clause = ", ".join(f'"{c}"' for c in table.pk_columns) if table.pk_columns else "ctid"
-            col_list = ", ".join(f'"{c}"' for c in table.columns)
+            # raw COPY — fastest possible path, pure sequential heap scan
+            # no ORDER BY, no subquery overhead
+            copy_sql = f'COPY "{table.name}" TO STDOUT'
 
             with ChunkProgress(table.name, "bold blue", total_rows, start_chunk, chunks_total, chunk_rows) as prog:
-                chunk_idx = start_chunk
-                rows_dumped = start_chunk * chunk_rows
-                t_start = time.monotonic()
+                splitter = _ChunkSplitter(
+                    table_dir=table_dir,
+                    table=table,
+                    manifest=manifest,
+                    settings=settings,
+                    schema_ddl=schema_ddl,
+                    index_defs=index_defs,
+                    chunks_total=chunks_total,
+                    start_chunk=start_chunk,
+                    progress=prog,
+                )
 
-                while chunk_idx < chunks_total and not interrupted:
-                    offset = chunk_idx * chunk_rows
-                    chunk_file = table_dir / manifest.chunk_filename(chunk_idx)
+                try:
+                    cur.copy_expert(copy_sql, splitter)
+                except KeyboardInterrupt:
+                    conn.cancel()
+                    raise
 
-                    # always use COPY for extraction — it's 100x faster
-                    copy_sql = f"""COPY (
-                        SELECT {col_list} FROM "{table.name}"
-                        ORDER BY {order_clause}
-                        LIMIT {chunk_rows} OFFSET {offset}
-                    ) TO STDOUT"""
+                # flush the last partial chunk
+                if not interrupted:
+                    splitter.flush_remaining()
 
-                    buf = BytesIO()
-                    try:
-                        cur.copy_expert(copy_sql, buf)
-                    except KeyboardInterrupt:
-                        conn.cancel()
-                        raise
-                    raw = buf.getvalue()
-
-                    chunk_row_count = raw.count(b"\n")
-                    if raw and not raw.endswith(b"\n"):
-                        chunk_row_count += 1
-
-                    # convert COPY output to full SQL file if insert mode
-                    if settings.dump_mode == "insert":
-                        is_first = (chunk_idx == 0 and start_chunk == 0)
-                        is_last = (chunk_idx == chunks_total - 1)
-                        raw = _build_sql_chunk(
-                            raw, table, settings, schema_ddl, index_defs,
-                            is_first=is_first, is_last=is_last,
-                        )
-
-                    if settings.compress:
-                        with gzip.open(chunk_file, "wb", compresslevel=settings.compress_level) as f:
-                            f.write(raw)
-                    else:
-                        with open(chunk_file, "wb") as f:
-                            f.write(raw)
-
-                    rows_dumped += chunk_row_count
-                    chunk_idx += 1
-                    manifest.chunks_completed = chunk_idx
-                    _write_manifest(manifest_path, manifest)
-
-                    elapsed = time.monotonic() - t_start
-                    rps = int(rows_dumped / elapsed) if elapsed > 0 else 0
-                    prog.update(rows_dumped, chunk_idx, f"{humanize.intcomma(rps)} rows/s")
+                chunk_idx = splitter.chunk_idx
+                rows_dumped = splitter.total_rows_seen
 
             if not interrupted:
+                manifest.chunks_completed = chunk_idx
+                manifest.chunks_total = chunk_idx
                 manifest.finished_at = datetime.now().isoformat()
                 _write_manifest(manifest_path, manifest)
                 total_file_size = sum(
@@ -212,15 +461,9 @@ def _build_sql_chunk(
     is_first: bool,
     is_last: bool,
 ) -> bytes:
-    """build a complete, self-contained .sql chunk file.
-
-    chunk 0 gets preamble (DROP, CREATE, TRUNCATE, drop indexes).
-    every chunk gets BEGIN/COMMIT if use_transactions is on.
-    last chunk gets index rebuilds.
-    """
+    """build a complete, self-contained .sql chunk file."""
     parts: list[str] = []
 
-    # ── header comment ───────────────────────────────────────────────────
     parts.append(f"-- dbtool dump: {table.name}")
     parts.append(f"-- generated: {datetime.now().isoformat()}")
     if is_first:
@@ -229,47 +472,38 @@ def _build_sql_chunk(
         parts.append("-- chunk: last (includes epilogue)")
     parts.append("")
 
-    # ── preamble (first chunk only) ──────────────────────────────────────
     if is_first:
         if settings.drop_on_restore:
             parts.append(f'DROP TABLE IF EXISTS "{table.name}" CASCADE;')
             parts.append("")
-
         if settings.recreate_schema and schema_ddl:
             parts.append("-- schema")
             parts.append(schema_ddl)
             parts.append("")
         elif settings.drop_on_restore and schema_ddl:
-            # if we dropped, we must recreate
             parts.append("-- schema (required after DROP)")
             parts.append(schema_ddl)
             parts.append("")
-
         if settings.truncate_before_restore and not settings.drop_on_restore:
             parts.append(f'TRUNCATE TABLE "{table.name}" CASCADE;')
             parts.append("")
-
         if settings.disable_indexes_on_restore and index_defs:
             parts.append("-- drop indexes for faster bulk load")
             for idx_name, _ in index_defs:
                 parts.append(f'DROP INDEX IF EXISTS "{idx_name}";')
             parts.append("")
 
-    # ── transaction open ─────────────────────────────────────────────────
     if settings.use_transactions:
         parts.append("BEGIN;")
         parts.append("")
 
-    # ── data ─────────────────────────────────────────────────────────────
     inserts = _copy_to_inserts(copy_data, table.name, table.columns, settings.insert_batch_size)
     parts.append(inserts)
 
-    # ── transaction close ────────────────────────────────────────────────
     if settings.use_transactions:
         parts.append("COMMIT;")
         parts.append("")
 
-    # ── epilogue (last chunk only) ───────────────────────────────────────
     if is_last and settings.disable_indexes_on_restore and index_defs:
         parts.append("-- rebuild indexes")
         for _, idx_defn in index_defs:
@@ -340,6 +574,7 @@ def _make_manifest(
         compressed=settings.compress,
         dump_mode=settings.dump_mode,
         has_schema=has_schema,
+        single_file=settings.single_file,
     )
 
 

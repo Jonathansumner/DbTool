@@ -7,25 +7,7 @@ import tomli_w
 DEFAULT_CHUNK_ROWS = 500_000
 
 
-def _resolve_project_dir() -> Path:
-    """check cwd for .dbtool/, walk up parents, fall back to ~/.dbtool/"""
-    # check cwd and parents for an existing .dbtool/
-    cwd = Path.cwd()
-    for p in [cwd, *cwd.parents]:
-        candidate = p / ".dbtool"
-        if candidate.is_dir():
-            return candidate
-        # stop at home dir
-        if p == Path.home():
-            break
-    # check if cwd has a pyproject.toml (project root) — use local .dbtool/
-    if (cwd / "pyproject.toml").exists():
-        return cwd / ".dbtool"
-    # fall back to home
-    return Path.home() / ".dbtool"
-
-
-PROJECT_DIR = _resolve_project_dir()
+PROJECT_DIR = Path.home() / ".dbtool"
 CONFIG_FILE = PROJECT_DIR / "config.toml"
 DEFAULT_DUMP_DIR = str(PROJECT_DIR / "dumps")
 
@@ -52,7 +34,7 @@ class DumpSettings:
     dump_dir: str = DEFAULT_DUMP_DIR
     chunk_rows: int = DEFAULT_CHUNK_ROWS
     compress: bool = True
-    compress_level: int = 6
+    compress_level: int = 1
     dump_mode: str = "copy"
     dump_schema: bool = True
     insert_batch_size: int = 1000
@@ -61,8 +43,12 @@ class DumpSettings:
     drop_on_restore: bool = False
     recreate_schema: bool = False
     disable_indexes_on_restore: bool = False
+    index_rebuild_mode: str = "after_each"
+    cooldown_between_tables: bool = False
+    cooldown_seconds: int = 600
     max_retries: int = 3
     retry_backoff: int = 2
+    single_file: bool = False
 
     @staticmethod
     def descriptions() -> dict[str, str]:
@@ -79,8 +65,12 @@ class DumpSettings:
             "drop_on_restore":  "DROP TABLE IF EXISTS before restore",
             "recreate_schema":  "Recreate table schema from dumped DDL",
             "disable_indexes_on_restore": "Drop indexes before restore, rebuild after",
+            "index_rebuild_mode": "after_each / after_all / skip",
+            "cooldown_between_tables": "Pause between tables to let db recover",
+            "cooldown_seconds": "Seconds to wait between tables",
             "max_retries":      "Max retry attempts for failed chunks",
             "retry_backoff":    "Base seconds for exponential backoff",
+            "single_file":      "Dump each table as one file (no chunking)",
         }
 
 

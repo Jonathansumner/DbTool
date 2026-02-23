@@ -99,3 +99,54 @@ class ChunkProgress:
             chunk_info=f"chunk {chunk_idx}/{self.chunks_total}",
             speed=speed_str,
         )
+
+
+class TransferProgress:
+    """progress bar for k8s transfers — tracks bytes across tables."""
+
+    def __init__(self, total_tables: int, total_bytes: int):
+        self.progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.fields[current]}"),
+            BarColumn(bar_width=40),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("•"),
+            TextColumn("{task.fields[table_info]}"),
+            TextColumn("•"),
+            TextColumn("{task.fields[size_info]}"),
+            TextColumn("•"),
+            TextColumn("{task.fields[speed]}"),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False,
+        )
+        self.total_tables = total_tables
+        self.total_bytes = total_bytes
+
+    def __enter__(self):
+        self.progress.__enter__()
+        self.task = self.progress.add_task(
+            "Transferring",
+            total=self.total_bytes,
+            completed=0,
+            current="",
+            table_info=f"0/{self.total_tables} tables",
+            size_info=f"0 B/{humanize.naturalsize(self.total_bytes, binary=True)}",
+            speed="",
+        )
+        return self
+
+    def __exit__(self, *args):
+        return self.progress.__exit__(*args)
+
+    def update(self, current: str, tables_done: int, bytes_done: int, speed_str: str):
+        self.progress.update(
+            self.task, completed=bytes_done,
+            current=current,
+            table_info=f"{tables_done}/{self.total_tables} tables",
+            size_info=f"{humanize.naturalsize(bytes_done, binary=True)}/{humanize.naturalsize(self.total_bytes, binary=True)}",
+            speed=speed_str,
+        )
